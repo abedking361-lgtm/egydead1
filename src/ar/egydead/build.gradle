@@ -1,0 +1,10 @@
+ext {
+    extName = 'EgyDead'
+    extClass = '.EgyDead'
+    themePkg = 'all.egydead'
+    baseUrl = 'https://tv10.egydead.live/h3/'
+    overrideVersionCode = 1
+    isNsfw = false
+}
+
+apply from: "$rootDir/common.gradle"
