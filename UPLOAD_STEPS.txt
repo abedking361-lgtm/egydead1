@@ -1,0 +1,21 @@
+EgyDead custom Aniyomi extension fix
+
+What changed:
+- Restored the original EgyDead watch flow (POST View=1 before reading servers).
+- Restored Dood/MixDrop/StreamWish/Uqload extraction.
+- Added a generic m3u8/mp4 fallback for rotating mirror domains.
+- Added an editable "رابط موقع EgyDead" setting inside Aniyomi.
+- The setting accepts the full current URL, e.g. https://tv10.egydead.live/h3/
+- Added a GitHub Actions workflow to build the APK.
+
+Upload/replace these files in your repository:
+1) src/ar/egydead/src/eu/kanade/tachiyomi/extension/ar/egydead/EgyDead.kt
+2) src/ar/egydead/build.gradle
+3) .github/workflows/build-extension.yml
+
+Then open GitHub > Actions > Build EgyDead Extension APK > Run workflow.
+After it finishes, open the run > Artifacts > egydead-extension-apk and download the APK.
+
+IMPORTANT:
+The custom APK is signed with a different key from the old public extension.
+If Android says the APK cannot be installed/update failed, uninstall the old Egy Dead extension first, then install the custom APK.
