@@ -36,10 +36,15 @@ jobs:
           mkdir -p anime-extensions/src/ar
           cp -R custom-extension/src/ar/egydead anime-extensions/src/ar/egydead
 
-      - name: Build APK
+      - name: Auto format EgyDead code
         working-directory: anime-extensions
         run: |
           chmod +x ./gradlew
+          ./gradlew :src:ar:egydead:spotlessApply
+
+      - name: Build APK
+        working-directory: anime-extensions
+        run: |
           ./gradlew :src:ar:egydead:assembleRelease --stacktrace
 
       - name: Collect APK
