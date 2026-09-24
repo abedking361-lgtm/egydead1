@@ -1,0 +1,471 @@
+diff --git a/src/ar/egydead/build.gradle b/src/ar/egydead/build.gradle
+index 54bb85a..8d2b948 100644
+--- a/src/ar/egydead/build.gradle
++++ b/src/ar/egydead/build.gradle
+@@ -1,7 +1,7 @@
+ ext {
+     extName = 'Egy Dead'
+     extClass = '.EgyDead'
+-    extVersionCode = 31
++    extVersionCode = 32
+ }
+ 
+ apply plugin: "kei.plugins.extension.legacy"
+@@ -10,6 +10,7 @@ dependencies {
+     implementation(project(':lib:doodextractor'))
+     implementation(project(':lib:filemoonextractor'))
+     implementation(project(':lib:mixdropextractor'))
++    implementation(project(':lib:megamaxmultiserver'))
+     implementation(project(':lib:mp4uploadextractor'))
+     implementation(project(':lib:okruextractor'))
+     implementation(project(':lib:streamtapeextractor'))
+diff --git a/src/ar/egydead/src/eu/kanade/tachiyomi/extension/ar/egydead/EgyDead.kt b/src/ar/egydead/src/eu/kanade/tachiyomi/extension/ar/egydead/EgyDead.kt
+index 846b6a2..b912aa4 100644
+--- a/src/ar/egydead/src/eu/kanade/tachiyomi/extension/ar/egydead/EgyDead.kt
++++ b/src/ar/egydead/src/eu/kanade/tachiyomi/extension/ar/egydead/EgyDead.kt
+@@ -5,6 +5,7 @@ import androidx.preference.ListPreference
+ import androidx.preference.PreferenceScreen
+ import aniyomi.lib.doodextractor.DoodExtractor
+ import aniyomi.lib.filemoonextractor.FilemoonExtractor
++import aniyomi.lib.megamaxmultiserver.MegaMaxMultiServer
+ import aniyomi.lib.mixdropextractor.MixDropExtractor
+ import aniyomi.lib.mp4uploadextractor.Mp4uploadExtractor
+ import aniyomi.lib.okruextractor.OkruExtractor
+@@ -26,7 +27,6 @@ import eu.kanade.tachiyomi.network.POST
+ import eu.kanade.tachiyomi.network.awaitSuccess
+ import keiyoushi.utils.ParsedAnimeHttpLegacySource
+ import keiyoushi.utils.getPreferencesLazy
+-import keiyoushi.utils.parallelCatchingFlatMap
+ import keiyoushi.utils.useAsJsoup
+ import okhttp3.FormBody
+ import okhttp3.Request
+@@ -216,37 +216,27 @@ class EgyDead :
+         val ordered = prioritizePlayerUrls(urls)
+         val (knownUrls, unknownUrls) = ordered.partition(::isKnownPlayer)
+ 
+-        // Known hosters are resolved in parallel.
+-        val knownResults = knownUrls.parallelCatchingFlatMap { url ->
+-            listOf(url to resolveKnownPlayer(url, referer))
+-        }
+-
+-        val knownVideos = knownResults.flatMap { it.second }
+-        if (knownVideos.isNotEmpty()) {
+-            return FastResolveResult(knownVideos.distinctVideos(), emptyList())
+-        }
+-
+-        // Unknown hosters get one cheap HTML pass in parallel before WebView fallback.
+-        val unknownResults = unknownUrls.parallelCatchingFlatMap { url ->
+-            listOf(url to resolveUnknownFast(url, referer))
++        // Resolve in priority order and stop as soon as one server works. Waiting for every
++        // server defeats the fast path when a slow or dead host is present beside a good one.
++        for (url in knownUrls) {
++            val videos = runCatching { resolveKnownPlayer(url, referer) }
++                .getOrDefault(emptyList())
++            if (videos.isNotEmpty()) {
++                return FastResolveResult(videos.distinctVideos(), emptyList())
++            }
+         }
+ 
+-        val unknownVideos = unknownResults.flatMap { it.second }
+-        if (unknownVideos.isNotEmpty()) {
+-            return FastResolveResult(unknownVideos.distinctVideos(), emptyList())
++        // Unknown hosters get a cheap HTML pass before WebView fallback.
++        for (url in unknownUrls) {
++            val videos = resolveUnknownFast(url, referer)
++            if (videos.isNotEmpty()) {
++                return FastResolveResult(videos.distinctVideos(), emptyList())
++            }
+         }
+ 
+-        val failedKnown = knownResults
+-            .filter { it.second.isEmpty() }
+-            .map { it.first }
+-
+-        val failedUnknown = unknownResults
+-            .filter { it.second.isEmpty() }
+-            .map { it.first }
+-
+         return FastResolveResult(
+             emptyList(),
+-            prioritizePlayerUrls(failedUnknown + failedKnown),
++            prioritizePlayerUrls(unknownUrls + knownUrls),
+         )
+     }
+ 
+@@ -258,10 +248,12 @@ class EgyDead :
+         if (url.isBlank()) return emptyList()
+ 
+         return when {
+-            url.contains(".m3u8", true) || url.contains(".mp4", true) -> {
++            isDirectVideo(url) -> {
+                 listOf(Video(url, "EgyDead Direct", url, playerHeaders(referer)))
+             }
+ 
++            isMegaMax(url) -> resolveMegaMax(url, referer)
++
+             url.contains("mixdrop", true) || url.contains("mdbekjwqa", true) -> {
+                 mixDropExtractor.videoFromUrl(url)
+             }
+@@ -331,6 +323,21 @@ class EgyDead :
+         }
+     }
+ 
++    private suspend fun resolveMegaMax(url: String, referer: String): List<Video> {
++        val providers = runCatching {
++            MegaMaxMultiServer(client, playerHeaders(referer)).extractUrls(url)
++        }.getOrDefault(emptyList())
++
++        val orderedUrls = prioritizePlayerUrls(providers.map { it.url })
++        for (providerUrl in orderedUrls) {
++            val videos = runCatching { resolveKnownPlayer(providerUrl, url) }
++                .getOrDefault(emptyList())
++            if (videos.isNotEmpty()) return videos
++        }
++
++        return emptyList()
++    }
++
+     private suspend fun resolveUnknownFast(
+         rawUrl: String,
+         referer: String,
+@@ -369,9 +376,13 @@ class EgyDead :
+             val nestedPlayers = collectPlayerUrls(document)
+                 .filter(::isKnownPlayer)
+ 
+-            nestedPlayers.parallelCatchingFlatMap { nestedUrl ->
+-                resolveKnownPlayer(nestedUrl, url)
++            for (nestedUrl in nestedPlayers) {
++                val videos = runCatching { resolveKnownPlayer(nestedUrl, url) }
++                    .getOrDefault(emptyList())
++                if (videos.isNotEmpty()) return@runCatching videos
+             }
++
++            emptyList()
+         }.getOrDefault(emptyList())
+     }
+ 
+@@ -383,7 +394,7 @@ class EgyDead :
+                 ".serversList li[data-link], " +
+                 "li[data-link]",
+         ).forEach {
+-            urls += it.attr("data-link")
++            urls += it.attr("abs:data-link").ifBlank { it.attr("data-link") }
+         }
+ 
+         document.select(
+@@ -395,7 +406,7 @@ class EgyDead :
+ 
+         document.select(
+             "iframe[src], iframe[data-src]",
+-        ).forEach {
++        ).filterNot(::isHiddenIframe).forEach {
+             urls += it.attr("abs:src")
+                 .ifBlank { it.attr("src") }
+                 .ifBlank { it.attr("abs:data-src") }
+@@ -421,14 +432,13 @@ class EgyDead :
+         return prioritizePlayerUrls(urls)
+     }
+ 
+-    private fun prioritizePlayerUrls(urls: List<String>): List<String> =
+-        urls.asSequence()
+-            .map(::normalizePlayerUrl)
+-            .filter { it.startsWith("http://") || it.startsWith("https://") }
+-            .filterNot(::isIgnoredPlayerUrl)
+-            .distinct()
+-            .sortedByDescending(::playerPriority)
+-            .toList()
++    private fun prioritizePlayerUrls(urls: List<String>): List<String> = urls.asSequence()
++        .map(::normalizePlayerUrl)
++        .filter { it.startsWith("http://") || it.startsWith("https://") }
++        .filterNot(::isIgnoredPlayerUrl)
++        .distinct()
++        .sortedByDescending(::playerPriority)
++        .toList()
+ 
+     private fun normalizePlayerUrl(url: String): String {
+         val clean = url
+@@ -451,133 +461,141 @@ class EgyDead :
+         if (url.contains("/embed/", true)) score += 40
+         if (url.contains("/e/", true)) score += 35
+         if (url.contains("/f/", true)) score += 30
+-        if (url.contains(".m3u8", true) || url.contains(".mp4", true)) score += 200
++        if (isDirectVideo(url)) score += 200
+ 
+         return score
+     }
+ 
+-    private fun isKnownPlayer(url: String): Boolean =
+-        url.contains(".m3u8", true) ||
+-            url.contains(".mp4", true) ||
+-            url.contains("mixdrop", true) ||
+-            url.contains("mdbekjwqa", true) ||
+-            isDood(url) ||
+-            isStreamWish(url) ||
+-            isVidHide(url) ||
+-            isFilemoon(url) ||
+-            url.contains("uqload", true) ||
+-            url.contains("mp4upload", true) ||
+-            isVoe(url) ||
+-            url.contains("streamtape", true) ||
+-            url.contains("stape", true) ||
+-            url.contains("shavetape", true) ||
+-            url.contains("ok.ru", true) ||
+-            url.contains("okru", true) ||
+-            isVidGuard(url)
+-
+-    private fun isDood(url: String): Boolean =
+-        listOf(
+-            "doodstream",
+-            "dood.",
+-            "ds2play",
+-            "ds2video",
+-            "dooood",
+-            "d000d",
+-            "d0000d",
+-        ).any { url.contains(it, true) }
+-
+-    private fun isStreamWish(url: String): Boolean =
+-        listOf(
+-            "streamwish",
+-            "wishembed",
+-            "strwish",
+-            "swhoi",
+-            "kswplayer",
+-            "neko-stream",
+-            "iplayerhls",
+-            "streamgg",
+-            "multimovies",
+-            "uqloads",
+-            "ajmidyad",
+-            "alhayabambi",
+-            "atabknh",
+-            "atabknhs",
+-        ).any { url.contains(it, true) }
+-
+-    private fun isVidHide(url: String): Boolean =
+-        listOf(
+-            "ahvsh",
+-            "streamhide",
+-            "guccihide",
+-            "streamvid",
+-            "vidhide",
+-            "kinoger",
+-            "smoothpre",
+-            "dhtpre",
+-            "peytonepre",
+-            "earnvids",
+-            "ryderjet",
+-        ).any { url.contains(it, true) }
+-
+-    private fun isFilemoon(url: String): Boolean =
+-        listOf(
+-            "filemoon",
+-            "moonplayer",
+-            "moviesm4u",
+-            "files.im",
+-        ).any { url.contains(it, true) }
+-
+-    private fun isVoe(url: String): Boolean =
+-        listOf(
+-            "voe.",
+-            "tubelessceliolymph",
+-            "simpulumlamerop",
+-            "urochsunloath",
+-            "nathanfromsubject",
+-            "metagnathtuggers",
+-            "donaldlineelse",
+-        ).any { url.contains(it, true) }
+-
+-    private fun isVidGuard(url: String): Boolean =
+-        listOf(
+-            "vembed",
+-            "listeamed",
+-            "bembed",
+-            "vgfplay",
+-            "vidguard",
+-        ).any { url.contains(it, true) }
+-
+-    private fun isIgnoredPlayerUrl(url: String): Boolean =
+-        listOf(
+-            "youtube.com",
+-            "youtu.be",
+-            "facebook.com",
+-            "instagram.com",
+-            "tiktok.com",
+-            "twitter.com",
+-            "x.com/",
+-            "doubleclick",
+-            "googlesyndication",
+-        ).any { url.contains(it, true) }
+-
+-    private fun playerHeaders(referer: String) =
+-        headers.newBuilder()
+-            .set("Referer", referer)
+-            .build()
+-
+-    private fun List<Video>.distinctVideos(): List<Video> =
+-        distinctBy {
+-            it.videoTitle to it.videoUrl.substringBefore("?")
+-        }
++    private fun isKnownPlayer(url: String): Boolean = isDirectVideo(url) ||
++        isMegaMax(url) ||
++        url.contains("mixdrop", true) ||
++        url.contains("mdbekjwqa", true) ||
++        isDood(url) ||
++        isStreamWish(url) ||
++        isVidHide(url) ||
++        isFilemoon(url) ||
++        url.contains("uqload", true) ||
++        url.contains("mp4upload", true) ||
++        isVoe(url) ||
++        url.contains("streamtape", true) ||
++        url.contains("stape", true) ||
++        url.contains("shavetape", true) ||
++        url.contains("ok.ru", true) ||
++        url.contains("okru", true) ||
++        isVidGuard(url)
++
++    private fun isDirectVideo(url: String): Boolean = DIRECT_VIDEO_REGEX.containsMatchIn(url)
++
++    private fun isMegaMax(url: String): Boolean = listOf(
++        "megamax.",
++        "megaup.",
++        "megacloud.",
++    ).any { url.contains(it, true) } &&
++        (url.contains("/iframe/", true) || url.contains("/leech/", true))
++
++    private fun isHiddenIframe(element: Element): Boolean {
++        val style = element.attr("style").replace(" ", "").lowercase()
++        return element.attr("width") == "0" ||
++            element.attr("height") == "0" ||
++            "width:0" in style ||
++            "height:0" in style ||
++            "left:-" in style ||
++            element.hasAttr("hidden")
++    }
++
++    private fun isDood(url: String): Boolean = listOf(
++        "doodstream",
++        "dood.",
++        "ds2play",
++        "ds2video",
++        "dooood",
++        "d000d",
++        "d0000d",
++    ).any { url.contains(it, true) }
++
++    private fun isStreamWish(url: String): Boolean = listOf(
++        "streamwish",
++        "wishembed",
++        "strwish",
++        "swhoi",
++        "kswplayer",
++        "neko-stream",
++        "iplayerhls",
++        "streamgg",
++        "multimovies",
++        "uqloads",
++        "ajmidyad",
++        "alhayabambi",
++        "atabknh",
++        "atabknhs",
++    ).any { url.contains(it, true) }
++
++    private fun isVidHide(url: String): Boolean = listOf(
++        "ahvsh",
++        "streamhide",
++        "guccihide",
++        "streamvid",
++        "vidhide",
++        "kinoger",
++        "smoothpre",
++        "dhtpre",
++        "peytonepre",
++        "earnvids",
++        "ryderjet",
++    ).any { url.contains(it, true) }
++
++    private fun isFilemoon(url: String): Boolean = listOf(
++        "filemoon",
++        "moonplayer",
++        "moviesm4u",
++        "files.im",
++    ).any { url.contains(it, true) }
++
++    private fun isVoe(url: String): Boolean = listOf(
++        "voe.",
++        "tubelessceliolymph",
++        "simpulumlamerop",
++        "urochsunloath",
++        "nathanfromsubject",
++        "metagnathtuggers",
++        "donaldlineelse",
++    ).any { url.contains(it, true) }
++
++    private fun isVidGuard(url: String): Boolean = listOf(
++        "vembed",
++        "listeamed",
++        "bembed",
++        "vgfplay",
++        "vidguard",
++    ).any { url.contains(it, true) }
++
++    private fun isIgnoredPlayerUrl(url: String): Boolean = listOf(
++        "youtube.com",
++        "youtu.be",
++        "facebook.com",
++        "instagram.com",
++        "tiktok.com",
++        "twitter.com",
++        "x.com/",
++        "doubleclick",
++        "googlesyndication",
++    ).any { url.contains(it, true) }
++
++    private fun playerHeaders(referer: String) = headers.newBuilder()
++        .set("Referer", referer)
++        .build()
++
++    private fun List<Video>.distinctVideos(): List<Video> = distinctBy {
++        it.videoTitle to it.videoUrl.substringBefore("?")
++    }
+ 
+-    override fun videoListSelector() =
+-        "ul.serversList li, " +
+-            ".serversList li, " +
+-            "li[data-link], " +
+-            "iframe[src], " +
+-            "iframe[data-src], " +
+-            "video[src], " +
+-            "source[src]"
++    override fun videoListSelector() = "ul.serversList li, " +
++        ".serversList li, " +
++        "li[data-link], " +
++        "iframe[src], " +
++        "iframe[data-src], " +
++        "video[src], " +
++        "source[src]"
+ 
+     override fun videoFromElement(element: Element) = throw UnsupportedOperationException()
+ 
+@@ -685,8 +703,7 @@ class EgyDead :
+ 
+     override fun latestUpdatesNextPageSelector(): String = "div.pagination ul.page-numbers li a.next, a.next"
+ 
+-    override fun latestUpdatesRequest(page: Int): Request =
+-        GET(if (page <= 1) homeUrl else "$baseUrl/?page=$page", headers)
++    override fun latestUpdatesRequest(page: Int): Request = GET(if (page <= 1) homeUrl else "$baseUrl/?page=$page", headers)
+ 
+     override fun latestUpdatesFromElement(element: Element): SAnime {
+         val anime = SAnime.create()
+@@ -737,6 +754,10 @@ class EgyDead :
+             "https?:[^\"'\\\\\\s]+(?:m3u8|mp4)[^\"'\\\\\\s]*",
+             RegexOption.IGNORE_CASE,
+         )
++        private val DIRECT_VIDEO_REGEX = Regex(
++            "\\.(?:m3u8|mp4)(?:[?#]|$)",
++            RegexOption.IGNORE_CASE,
++        )
+         private val PLAYER_URL_REGEX = Regex(
+             "https?://[^\\s\"'<>]+",
+             RegexOption.IGNORE_CASE,
