@@ -1,0 +1,56 @@
+name: Build EgyDead Extension APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/ar/egydead/**"
+      - ".github/workflows/build-extension.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: custom-extension
+
+      - name: Checkout compatible Aniyomi extension build repo
+        uses: actions/checkout@v4
+        with:
+          repository: yuzono/anime-extensions
+          ref: 0727cafbeeb64fbe1cdaafc122defef2341c9a1f
+          path: anime-extensions
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Copy EgyDead module
+        run: |
+          rm -rf anime-extensions/src/ar/egydead
+          mkdir -p anime-extensions/src/ar
+          cp -R custom-extension/src/ar/egydead anime-extensions/src/ar/egydead
+
+      - name: Build APK
+        working-directory: anime-extensions
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :src:ar:egydead:assembleRelease --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p output
+          find anime-extensions/src/ar/egydead -type f -name "*.apk" -print -exec cp {} output/ \;
+          test -n "$(find output -type f -name '*.apk' -print -quit)"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: egydead-extension-apk
+          path: output/*.apk
+          if-no-files-found: error
